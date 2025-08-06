@@ -12,25 +12,41 @@ struct Args {
     #[arg(short, long)]
     path: String,
 
-    /// 要推送的分支名
+    /// 要推送的分支名（MR模式必需）
     #[arg(short, long)]
-    source_branch: String,
+    source_branch: Option<String>,
 
-    /// 目标合并分支名
+    /// 目标合并分支名（MR模式必需）
     #[arg(short, long)]
-    target_branch: String,
+    target_branch: Option<String>,
 
-    /// GitLab API URL (例如: https://gitlab.com/api/v4)
+    /// GitLab API URL (例如: https://gitlab.com/api/v4)（MR模式必需）
     #[arg(short, long)]
-    gitlab_url: String,
+    gitlab_url: Option<String>,
 
-    /// GitLab API Token
+    /// GitLab API Token（MR模式可选）
     #[arg(short, long)]
     gitlab_token: Option<String>,
 
-    /// 是否强制推送
+    /// 是否强制推送（MR模式可选）
     #[arg(short, long, default_value = "false")]
     force: bool,
+
+    /// 要切换到的分支名（Tag模式必需）
+    #[arg(short, long)]
+    checkout_branch: Option<String>,
+
+    /// 要创建的tag名（Tag模式必需）
+    #[arg(long)]
+    tag_name: Option<String>,
+
+    /// tag的注释信息（Tag模式可选）
+    #[arg(long)]
+    tag_message: Option<String>,
+
+    /// 操作模式：mr（创建merge request）或 tag（创建tag）
+    #[arg(short, long, default_value = "mr")]
+    mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +168,90 @@ fn get_remote_url(repo_path: &str) -> Result<String> {
     Ok(url.trim().to_string())
 }
 
+fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<()> {
+    // 切换到指定分支
+    let output = Command::new("git")
+        .args(["checkout", branch_name])
+        .current_dir(repo_path)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to checkout branch {} in {}", branch_name, repo_path));
+    }
+
+    println!("✅ 成功切换到分支: {}", branch_name);
+    
+    // 拉取最新代码
+    let pull_output = Command::new("git")
+        .args(["pull", "origin", branch_name])
+        .current_dir(repo_path)
+        .output()?;
+
+    if !pull_output.status.success() {
+        // 如果拉取失败，记录警告但不中断流程
+        println!("⚠️  警告: 拉取分支 {} 最新代码失败，继续执行", branch_name);
+        if let Ok(error_msg) = String::from_utf8(pull_output.stderr) {
+            if !error_msg.trim().is_empty() {
+                println!("   错误信息: {}", error_msg.trim());
+            }
+        }
+    } else {
+        println!("✅ 成功拉取分支 {} 的最新代码", branch_name);
+    }
+    
+    Ok(())
+}
+
+fn create_tag(repo_path: &str, tag_name: &str, message: Option<&str>) -> Result<()> {
+    let mut args = vec!["tag"];
+    
+    if let Some(msg) = message {
+        args.extend_from_slice(&["-a", tag_name, "-m", msg]);
+    } else {
+        args.push(tag_name);
+    }
+
+    let output = Command::new("git")
+        .args(&args)
+        .current_dir(repo_path)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to create tag {} in {}", tag_name, repo_path));
+    }
+
+    println!("✅ 成功创建tag: {}", tag_name);
+    Ok(())
+}
+
+fn push_tag(repo_path: &str, tag_name: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["push", "origin", tag_name])
+        .current_dir(repo_path)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to push tag {} in {}", tag_name, repo_path));
+    }
+
+    println!("✅ 成功推送tag: {}", tag_name);
+    Ok(())
+}
+
+fn get_current_branch(repo_path: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_path)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Failed to get current branch in {}", repo_path));
+    }
+
+    let branch = String::from_utf8(output.stdout)?;
+    Ok(branch.trim().to_string())
+}
+
 
 fn extract_project_path_from_url(url: &str) -> Result<String> {
     // 处理不同的Git URL格式
@@ -178,55 +278,130 @@ fn extract_project_path_from_url(url: &str) -> Result<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 获取GitLab token
-    let token = if let Some(token) = args.gitlab_token {
-        token
+    // 获取GitLab token（仅MR模式需要）
+    let token = if args.mode == "mr" {
+        if let Some(token) = args.gitlab_token {
+            token
+        } else {
+            std::env::var("GITLAB_TOKEN").map_err(|_| {
+                anyhow!("GitLab token not provided. Please set GITLAB_TOKEN environment variable or use --gitlab-token")
+            })?
+        }
     } else {
-        std::env::var("GITLAB_TOKEN").map_err(|_| {
-            anyhow!("GitLab token not provided. Please set GITLAB_TOKEN environment variable or use --gitlab-token")
-        })?
+        String::new() // Tag模式不需要token
     };
 
-    println!("🚀 开始批量创建Merge Request...");
+    println!("🚀 开始批量操作...");
     println!("📁 搜索路径: {}", args.path);
-    println!("🌿 源分支: {}", args.source_branch);
-    println!("🎯 目标分支: {}", args.target_branch);
+    println!("🔧 操作模式: {}", args.mode);
 
-    // 创建GitLab客户端
-    let gitlab_client = GitLabClient::new(args.gitlab_url, token);
+    match args.mode.as_str() {
+        "mr" => {
+            let source_branch = args.source_branch.ok_or_else(|| {
+                anyhow!("在MR模式下，必须指定 --source-branch 参数")
+            })?;
+            
+            let target_branch = args.target_branch.ok_or_else(|| {
+                anyhow!("在MR模式下，必须指定 --target-branch 参数")
+            })?;
+            
+            let gitlab_url = args.gitlab_url.ok_or_else(|| {
+                anyhow!("在MR模式下，必须指定 --gitlab-url 参数")
+            })?;
+            
+            println!("🌿 源分支: {}", source_branch);
+            println!("🎯 目标分支: {}", target_branch);
+            
+            // 创建GitLab客户端
+            let gitlab_client = GitLabClient::new(gitlab_url, token);
 
-    // 查找所有git仓库
-    let repositories = find_git_repositories(&args.path)?;
-    println!("📦 找到 {} 个Git仓库", repositories.len());
+            // 查找所有git仓库
+            let repositories = find_git_repositories(&args.path)?;
+            println!("📦 找到 {} 个Git仓库", repositories.len());
 
-    let mut results = Vec::new();
+            let mut results = Vec::new();
 
-    for repo_path in repositories {
-        println!("\n🔍 处理仓库: {}", repo_path);
-        
-        match process_repository(
-            &repo_path,
-            &args.source_branch,
-            &args.target_branch,
-            &gitlab_client,
-        ).await {
-            Ok(result) => {
-                println!("✅ 成功: {}", result);
-                results.push(result);
+            for repo_path in repositories {
+                println!("\n🔍 处理仓库: {}", repo_path);
+                
+                match process_repository(
+                    &repo_path,
+                    &source_branch,
+                    &target_branch,
+                    &gitlab_client,
+                ).await {
+                    Ok(result) => {
+                        println!("✅ 成功: {}", result);
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        println!("❌ 失败: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                println!("❌ 失败: {}", e);
+
+            println!("\n📊 处理完成!");
+            println!("✅ 成功创建 {} 个Merge Request", results.len());
+            
+            if !results.is_empty() {
+                println!("\n📋 创建的Merge Request:");
+                for result in results {
+                    println!("  - {}", result);
+                }
             }
         }
-    }
+        "tag" => {
+            let checkout_branch = args.checkout_branch.ok_or_else(|| {
+                anyhow!("在tag模式下，必须指定 --checkout-branch 参数")
+            })?;
+            
+            let tag_name = args.tag_name.ok_or_else(|| {
+                anyhow!("在tag模式下，必须指定 --tag-name 参数")
+            })?;
+            
+            println!("🌿 切换分支: {}", checkout_branch);
+            println!("🏷️ 创建tag: {}", tag_name);
+            if let Some(ref msg) = args.tag_message {
+                println!("📝 Tag消息: {}", msg);
+            }
 
-    println!("\n📊 处理完成!");
-    println!("✅ 成功创建 {} 个Merge Request", results.len());
-    
-    if !results.is_empty() {
-        println!("\n📋 创建的Merge Request:");
-        for result in results {
-            println!("  - {}", result);
+            // 查找所有git仓库
+            let repositories = find_git_repositories(&args.path)?;
+            println!("📦 找到 {} 个Git仓库", repositories.len());
+
+            let mut results = Vec::new();
+
+            for repo_path in repositories {
+                println!("\n🔍 处理仓库: {}", repo_path);
+                
+                match process_repository_for_tag(
+                    &repo_path,
+                    &checkout_branch,
+                    &tag_name,
+                    args.tag_message.as_deref(),
+                ).await {
+                    Ok(result) => {
+                        println!("✅ 成功: {}", result);
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        println!("❌ 失败: {}", e);
+                    }
+                }
+            }
+
+            println!("\n📊 处理完成!");
+            println!("✅ 成功创建 {} 个Tag", results.len());
+            
+            if !results.is_empty() {
+                println!("\n📋 创建的Tag:");
+                for result in results {
+                    println!("  - {}", result);
+                }
+            }
+        }
+        _ => {
+            return Err(anyhow!("不支持的模式: {}。支持的模式: mr, tag", args.mode));
         }
     }
 
@@ -255,4 +430,29 @@ async fn process_repository(
         .await?;
     
     Ok(format!("{}: {}", project.name, merge_request.web_url))
+}
+
+async fn process_repository_for_tag(
+    repo_path: &str,
+    target_branch: &str,
+    tag_name: &str,
+    tag_message: Option<&str>,
+) -> Result<String> {
+    // 获取当前分支
+    let current_branch = get_current_branch(repo_path)?;
+    println!("📍 当前分支: {}", current_branch);
+    
+    // 切换到指定分支
+    checkout_branch(repo_path, target_branch)?;
+    
+    // 创建tag
+    create_tag(repo_path, tag_name, tag_message)?;
+    
+    // 推送tag
+    push_tag(repo_path, tag_name)?;
+    
+    // 切换回原来的分支
+    checkout_branch(repo_path, &current_branch)?;
+    
+    Ok(format!("{}: 成功创建并推送tag {}", repo_path, tag_name))
 }
