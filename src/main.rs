@@ -2,15 +2,16 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::process::Command;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// 要遍历的根路径
+    /// 要遍历的根路径（MR和Tag模式必需，List-MRs模式不需要）
     #[arg(short, long)]
-    path: String,
+    path: Option<String>,
 
     /// 要推送的分支名（MR模式必需）
     #[arg(short, long)]
@@ -21,11 +22,11 @@ struct Args {
     target_branch: Option<String>,
 
     /// GitLab API URL (例如: https://gitlab.com/api/v4)（MR模式必需）
-    #[arg(short, long)]
+    #[arg(short = 'g', long)]
     gitlab_url: Option<String>,
 
     /// GitLab API Token（MR模式可选）
-    #[arg(short, long)]
+    #[arg(short = 'k', long)]
     gitlab_token: Option<String>,
 
     /// 是否强制推送（MR模式可选）
@@ -44,9 +45,13 @@ struct Args {
     #[arg(long)]
     tag_message: Option<String>,
 
-    /// 操作模式：mr（创建merge request）或 tag（创建tag）
+    /// 操作模式：mr（创建merge request）、tag（创建tag）或 list-mrs（列出merge requests）
     #[arg(short, long, default_value = "mr")]
     mode: String,
+
+    /// MR状态筛选（list-mrs模式使用）: opened, closed, locked, merged, all
+    #[arg(long, default_value = "opened")]
+    mr_state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,6 +71,29 @@ struct Project {
 #[derive(Debug, Deserialize)]
 struct MergeRequest {
     web_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeRequestDetail {
+    #[allow(dead_code)]
+    id: u64,
+    iid: u64,
+    title: String,
+    state: String,
+    source_branch: String,
+    target_branch: String,
+    web_url: String,
+    created_at: String,
+    updated_at: String,
+    author: Author,
+    #[allow(dead_code)]
+    project_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    name: String,
+    username: String,
 }
 
 struct GitLabClient {
@@ -133,6 +161,50 @@ impl GitLabClient {
 
         let merge_request: MergeRequest = response.json().await?;
         Ok(merge_request)
+    }
+
+    async fn list_my_merge_requests(&self, state: &str) -> Result<Vec<MergeRequestDetail>> {
+        let url = format!("{}/merge_requests", self.base_url);
+        
+        let response = self
+            .client
+            .get(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .query(&[("scope", "created_by_me"), ("state", state)])
+            .send()
+            .await?;
+
+        let status = response.status();
+        
+        if !status.is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!(
+                "Failed to list merge requests (HTTP {}): {}\n提示: 请确保 GitLab URL 正确，格式应为: https://your-gitlab.com/api/v4",
+                status.as_u16(),
+                error_text
+            ));
+        }
+
+        // 先获取响应文本，用于调试
+        let response_text = response.text().await?;
+        
+        // 尝试解析 JSON
+        match serde_json::from_str::<Vec<MergeRequestDetail>>(&response_text) {
+            Ok(merge_requests) => Ok(merge_requests),
+            Err(e) => {
+                // 显示前 200 个字符的响应内容用于调试
+                let preview = if response_text.len() > 200 {
+                    format!("{}...", &response_text[..200])
+                } else {
+                    response_text.clone()
+                };
+                Err(anyhow!(
+                    "Failed to parse merge requests response: {}\nResponse preview: {}\n提示: 请确保 GitLab URL 正确，格式应为: https://your-gitlab.com/api/v4",
+                    e,
+                    preview
+                ))
+            }
+        }
     }
 }
 
@@ -278,8 +350,8 @@ fn extract_project_path_from_url(url: &str) -> Result<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 获取GitLab token（仅MR模式需要）
-    let token = if args.mode == "mr" {
+    // 获取GitLab token（MR模式和list-mrs模式需要）
+    let token = if args.mode == "mr" || args.mode == "list-mrs" {
         if let Some(token) = args.gitlab_token {
             token
         } else {
@@ -292,11 +364,17 @@ async fn main() -> Result<()> {
     };
 
     println!("🚀 开始批量操作...");
-    println!("📁 搜索路径: {}", args.path);
+    if let Some(ref path) = args.path {
+        println!("📁 搜索路径: {}", path);
+    }
     println!("🔧 操作模式: {}", args.mode);
 
     match args.mode.as_str() {
         "mr" => {
+            let path = args.path.ok_or_else(|| {
+                anyhow!("在MR模式下，必须指定 --path 参数")
+            })?;
+            
             let source_branch = args.source_branch.ok_or_else(|| {
                 anyhow!("在MR模式下，必须指定 --source-branch 参数")
             })?;
@@ -316,7 +394,7 @@ async fn main() -> Result<()> {
             let gitlab_client = GitLabClient::new(gitlab_url, token);
 
             // 查找所有git仓库
-            let repositories = find_git_repositories(&args.path)?;
+            let repositories = find_git_repositories(&path)?;
             println!("📦 找到 {} 个Git仓库", repositories.len());
 
             let mut results = Vec::new();
@@ -351,6 +429,10 @@ async fn main() -> Result<()> {
             }
         }
         "tag" => {
+            let path = args.path.ok_or_else(|| {
+                anyhow!("在tag模式下，必须指定 --path 参数")
+            })?;
+            
             let checkout_branch = args.checkout_branch.ok_or_else(|| {
                 anyhow!("在tag模式下，必须指定 --checkout-branch 参数")
             })?;
@@ -366,7 +448,7 @@ async fn main() -> Result<()> {
             }
 
             // 查找所有git仓库
-            let repositories = find_git_repositories(&args.path)?;
+            let repositories = find_git_repositories(&path)?;
             println!("📦 找到 {} 个Git仓库", repositories.len());
 
             let mut results = Vec::new();
@@ -400,8 +482,48 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        "list-mrs" => {
+            let gitlab_url = args.gitlab_url.ok_or_else(|| {
+                anyhow!("在list-mrs模式下，必须指定 --gitlab-url 参数")
+            })?;
+            
+            println!("📋 MR状态筛选: {}", args.mr_state);
+            
+            // 创建GitLab客户端
+            let gitlab_client = GitLabClient::new(gitlab_url, token);
+            
+            // 获取MR列表
+            match gitlab_client.list_my_merge_requests(&args.mr_state).await {
+                Ok(merge_requests) => {
+                    println!("\n📊 找到 {} 个Merge Request", merge_requests.len());
+                    
+                    if merge_requests.is_empty() {
+                        println!("暂无符合条件的Merge Request");
+                    } else {
+                        println!("\n📋 Merge Request列表:");
+                        println!("{}", "=".repeat(100));
+                        
+                        for mr in merge_requests {
+                            println!("\n🔹 MR #{} - {}", mr.iid, mr.title);
+                            println!("   状态: {}", mr.state);
+                            println!("   作者: {} (@{})", mr.author.name, mr.author.username);
+                            println!("   分支: {} → {}", mr.source_branch, mr.target_branch);
+                            println!("   创建时间: {}", mr.created_at);
+                            println!("   更新时间: {}", mr.updated_at);
+                            println!("   链接: {}", mr.web_url);
+                        }
+                        
+                        println!("\n{}", "=".repeat(100));
+                    }
+                }
+                Err(e) => {
+                    println!("❌ 获取Merge Request列表失败: {}", e);
+                    return Err(e);
+                }
+            }
+        }
         _ => {
-            return Err(anyhow!("不支持的模式: {}。支持的模式: mr, tag", args.mode));
+            return Err(anyhow!("不支持的模式: {}。支持的模式: mr, tag, list-mrs", args.mode));
         }
     }
 
