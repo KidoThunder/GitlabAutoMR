@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// 要遍历的根路径（MR和Tag模式必需，List-MRs模式不需要）
+    /// 要遍历的根路径（MR / Tag 模式必需，list-mrs / approve-mrs 模式不需要）
     #[arg(short, long)]
     path: Option<String>,
 
@@ -24,6 +24,10 @@ struct Args {
     /// GitLab API URL (例如: https://gitlab.com/api/v4)（MR模式必需）
     #[arg(short = 'g', long)]
     gitlab_url: Option<String>,
+
+    /// GitLab Group 路径（approve-mrs 模式使用），例如: server/lobby
+    #[arg(long)]
+    group_path: Option<String>,
 
     /// GitLab API Token（MR模式可选）
     #[arg(short = 'k', long)]
@@ -45,11 +49,15 @@ struct Args {
     #[arg(long)]
     tag_message: Option<String>,
 
-    /// 操作模式：mr（创建merge request）、tag（创建tag）或 list-mrs（列出merge requests）
+    /// 操作模式：
+    /// - mr: 创建 Merge Request
+    /// - tag: 创建 Tag
+    /// - list-mrs: 列出当前用户的 Merge Requests
+    /// - approve-mrs: 批量“同意/批准”指定分支的 Merge Requests（调用 approve API）
     #[arg(short, long, default_value = "mr")]
     mode: String,
 
-    /// MR状态筛选（list-mrs模式使用）: opened, closed, locked, merged, all
+    /// MR状态筛选（list-mrs 模式使用）: opened, closed, locked, merged, all
     #[arg(long, default_value = "opened")]
     mr_state: String,
 }
@@ -121,8 +129,15 @@ impl GitLabClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(anyhow!("Failed to get project: {}", response.status()));
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to get project `{}` (HTTP {}): {}",
+                path,
+                status.as_u16(),
+                body
+            ));
         }
 
         let project: Project = response.json().await?;
@@ -165,7 +180,7 @@ impl GitLabClient {
 
     async fn list_my_merge_requests(&self, state: &str) -> Result<Vec<MergeRequestDetail>> {
         let url = format!("{}/merge_requests", self.base_url);
-        
+
         let response = self
             .client
             .get(&url)
@@ -205,6 +220,101 @@ impl GitLabClient {
                 ))
             }
         }
+    }
+
+    /// 列出指定项目中符合条件的 Merge Request
+    async fn list_project_merge_requests(
+        &self,
+        project_id: u64,
+        state: &str,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<Vec<MergeRequestDetail>> {
+        let url = format!("{}/projects/{}/merge_requests", self.base_url, project_id);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .query(&[
+                ("state", state),
+                ("source_branch", source_branch),
+                ("target_branch", target_branch),
+            ])
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!(
+                "Failed to list project merge requests (HTTP {}): {}",
+                status.as_u16(),
+                error_text
+            ));
+        }
+
+        let merge_requests: Vec<MergeRequestDetail> = response.json().await?;
+        Ok(merge_requests)
+    }
+
+    /// 列出指定 Group 下的所有项目（包含子 Group）
+    async fn list_group_projects(&self, group_path: &str) -> Result<Vec<Project>> {
+        let url = format!(
+            "{}/groups/{}/projects",
+            self.base_url,
+            urlencoding::encode(group_path)
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .query(&[("include_subgroups", "true"), ("per_page", "100")])
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!(
+                "Failed to list group projects for `{}` (HTTP {}): {}",
+                group_path,
+                status.as_u16(),
+                error_text
+            ));
+        }
+
+        let projects: Vec<Project> = response.json().await?;
+        Ok(projects)
+    }
+
+    /// 批准（approve）指定的 Merge Request
+    async fn merge_merge_request(&self, project_id: u64, mr_iid: u64) -> Result<()> {
+        let url = format!(
+            "{}/projects/{}/merge_requests/{}/approve",
+            self.base_url, project_id, mr_iid
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!(
+                "Failed to approve merge request #{} (HTTP {}): {}",
+                mr_iid,
+                status.as_u16(),
+                error_text
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -350,8 +460,8 @@ fn extract_project_path_from_url(url: &str) -> Result<String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // 获取GitLab token（MR模式和list-mrs模式需要）
-    let token = if args.mode == "mr" || args.mode == "list-mrs" {
+    // 获取GitLab token（MR / list-mrs / approve-mrs 模式需要）
+    let token = if args.mode == "mr" || args.mode == "list-mrs" || args.mode == "approve-mrs" {
         if let Some(token) = args.gitlab_token {
             token
         } else {
@@ -522,8 +632,67 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        "approve-mrs" => {
+            let gitlab_url = args.gitlab_url.ok_or_else(|| {
+                anyhow!("在 approve-mrs 模式下，必须指定 --gitlab-url 参数")
+            })?;
+
+            let group_path = args.group_path.ok_or_else(|| {
+                anyhow!("在 approve-mrs 模式下，必须指定 --group-path 参数，例如 server/lobby")
+            })?;
+
+            // 默认为从 dev 到 release，可以通过参数覆盖
+            let source_branch = args.source_branch.unwrap_or_else(|| "dev".to_string());
+            let target_branch = args
+                .target_branch
+                .unwrap_or_else(|| "release".to_string());
+
+            println!("📂 GitLab Group: {}", group_path);
+            println!("🌿 源分支(待审批): {}", source_branch);
+            println!("🎯 目标分支: {}", target_branch);
+
+            // 创建GitLab客户端
+            let gitlab_client = GitLabClient::new(gitlab_url, token);
+
+            // 获取 Group 下的项目列表
+            let projects = gitlab_client.list_group_projects(&group_path).await?;
+            println!(
+                "📦 在 group `{}` 下找到 {} 个项目",
+                group_path,
+                projects.len()
+            );
+
+            let mut results = Vec::new();
+
+            for project in projects {
+                println!("\n🔍 处理项目: {} (id: {})", project.name, project.id);
+
+                match process_project_for_approve(
+                    &project,
+                    &source_branch,
+                    &target_branch,
+                    &gitlab_client,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        println!("✅ {}", result);
+                        results.push(result);
+                    }
+                    Err(e) => {
+                        println!("❌ 失败: {}", e);
+                    }
+                }
+            }
+
+            println!("\n📊 处理完成!");
+            println!("✅ 已处理 {} 个项目的 Merge Request 审批", results.len());
+        }
         _ => {
-            return Err(anyhow!("不支持的模式: {}。支持的模式: mr, tag, list-mrs", args.mode));
+            return Err(anyhow!(
+                "不支持的模式: {}。支持的模式: mr, tag, list-mrs, approve-mrs",
+                args.mode
+            ));
         }
     }
 
@@ -543,7 +712,25 @@ async fn process_repository(
     let project_path = extract_project_path_from_url(&remote_url)?;
     
     // 获取项目信息
-    let project = gitlab_client.get_project_by_path(&project_path).await?;
+    let project = match gitlab_client.get_project_by_path(&project_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e.to_string();
+            // 对于无权限/未授权的项目，记录并跳过，而不是中断整个批量操作
+            if msg.contains("401") || msg.contains("Unauthorized") {
+                println!(
+                    "⚠️  无权限访问项目 `{}` (repo: {})，跳过该仓库。详情: {}",
+                    project_path, repo_path, msg
+                );
+                return Ok(format!(
+                    "{}: 无权限访问项目 `{}`，已跳过",
+                    repo_path, project_path
+                ));
+            }
+            // 其他错误继续向上抛出
+            return Err(e);
+        }
+    };
     
     // 创建merge request
     let title = format!("{} to {}", source_branch, target_branch);
@@ -577,4 +764,56 @@ async fn process_repository_for_tag(
     checkout_branch(repo_path, &current_branch)?;
     
     Ok(format!("{}: 成功创建并推送tag {}", repo_path, tag_name))
+}
+
+/// 处理单个项目：查找并批准从 source_branch 到 target_branch 的 Merge Requests
+async fn process_project_for_approve(
+    project: &Project,
+    source_branch: &str,
+    target_branch: &str,
+    gitlab_client: &GitLabClient,
+) -> Result<String> {
+    // 获取该项目中符合条件的 MR（默认仅处理打开状态的）
+    let mrs = gitlab_client
+        .list_project_merge_requests(project.id, "opened", source_branch, target_branch)
+        .await?;
+
+    if mrs.is_empty() {
+        return Ok(format!(
+            "{}: 无待审批的 MR ({} -> {})",
+            project.name, source_branch, target_branch
+        ));
+    }
+
+    println!(
+        "📋 在项目 {} 中找到 {} 个待审批的 MR ({} -> {})",
+        project.name,
+        mrs.len(),
+        source_branch,
+        target_branch
+    );
+
+    let total = mrs.len();
+    let mut approved = 0usize;
+
+    for mr in mrs {
+        println!(
+            "  🔹 MR #{} - {} ({} -> {})",
+            mr.iid, mr.title, mr.source_branch, mr.target_branch
+        );
+        match gitlab_client.merge_merge_request(project.id, mr.iid).await {
+            Ok(()) => {
+                println!("     ✅ 已批准 MR #{}: {}", mr.iid, mr.web_url);
+                approved += 1;
+            }
+            Err(e) => {
+                println!("     ❌ 合并 MR #{} 失败: {}", mr.iid, e);
+            }
+        }
+    }
+
+    Ok(format!(
+        "{}: 成功批准 {}/{} 个 MR ({} -> {})",
+        project.name, approved, total, source_branch, target_branch
+    ))
 }
