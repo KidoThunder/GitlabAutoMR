@@ -7,7 +7,7 @@
    cargo build --release
    ```
 
-2. **获取GitLab Token**（MR模式和List-MRs模式需要）
+2. **获取GitLab Token**（MR、list-mrs、approve-mrs 模式需要）
    - 登录GitLab → Settings → Access Tokens
    - 创建Personal Access Token，确保有 `api` 权限
 
@@ -50,13 +50,33 @@
      --mr-state merged
    ```
 
+### Approve-MRs模式（批量批准 Merge Requests）
+对指定 GitLab Group 下的所有项目，查找「源分支 → 目标分支」的已打开 MR 并调用 Approve API 批准。默认源分支 `dev`，目标分支 `release`。
+
+   ```bash
+   # 批准 group server/lobby 下 dev → release 的 MR
+   ./target/release/autoMR \
+     --mode approve-mrs \
+     --gitlab-url https://gitlab.com/api/v4 \
+     --gitlab-token YOUR_TOKEN \
+     --group-path server/lobby
+
+   # 指定源分支与目标分支
+   ./target/release/autoMR \
+     --mode approve-mrs \
+     --gitlab-url https://gitlab.com/api/v4 \
+     --group-path server/lobby \
+     --source-branch feature/xxx \
+     --target-branch main
+   ```
+
 ## 参数说明
 
 ### 通用参数
 | 参数 | 短参数 | 必需 | 说明 |
 |------|--------|------|------|
-| `--path` | `-p` | ✅/❌ | 要遍历的根路径（MR和Tag模式必需，List-MRs模式不需要） |
-| `--mode` | `-m` | ❌ | 操作模式：mr、tag 或 list-mrs [默认: mr] |
+| `--path` | `-p` | ✅/❌ | 要遍历的根路径（MR 和 Tag 模式必需；list-mrs、approve-mrs 不需要） |
+| `--mode` | `-m` | ❌ | 操作模式：mr、tag、list-mrs、approve-mrs [默认: mr] |
 
 ### MR模式参数
 | 参数 | 短参数 | 必需 | 说明 |
@@ -78,8 +98,17 @@
 | 参数 | 短参数 | 必需 | 说明 |
 |------|--------|------|------|
 | `--gitlab-url` | `-g` | ✅ | GitLab API URL |
-| `--gitlab-token` | `-k` | ❌ | GitLab API Token (也可用环境变量) |
+| `--gitlab-token` | `-k` | ❌ | GitLab API Token (也可用环境变量 GITLAB_TOKEN) |
 | `--mr-state` | - | ❌ | MR状态筛选: opened, closed, locked, merged, all [默认: opened] |
+
+### Approve-MRs模式参数
+| 参数 | 短参数 | 必需 | 说明 |
+|------|--------|------|------|
+| `--gitlab-url` | `-g` | ✅ | GitLab API URL |
+| `--group-path` | - | ✅ | GitLab Group 路径，如 server/lobby（含子 Group 下的项目） |
+| `--source-branch` | `-s` | ❌ | 待审批 MR 的源分支 [默认: dev] |
+| `--target-branch` | `-t` | ❌ | 待审批 MR 的目标分支 [默认: release] |
+| `--gitlab-token` | `-k` | ❌ | GitLab API Token (也可用环境变量 GITLAB_TOKEN) |
 
 ## 环境变量
 
@@ -91,13 +120,15 @@ export GITLAB_TOKEN="your_token_here"
 ## 功能特性
 
 - 🔍 自动遍历指定路径下的所有Git仓库
-- 🚀 支持三种操作模式：
+- 🚀 支持四种操作模式：
   - **MR模式**: 推送指定分支到远程仓库并创建GitLab merge request
   - **Tag模式**: 切换到指定分支并创建Git tag
   - **List-MRs模式**: 列出所有由你创建的merge requests，支持状态筛选
+  - **Approve-MRs模式**: 批量批准指定 Group 下、从源分支到目标分支的 Merge Requests
 - 📝 自动创建GitLab merge request
 - 🏷️ 自动创建和推送Git tag
 - 📋 查看和筛选你创建的merge requests
+- ✅ 按 GitLab Group 批量批准指定分支的 Merge Requests
 - 🔄 自动拉取分支最新代码
 - 🎯 MR标题格式：`{源分支} to {目标分支}`
 - 📊 详细的执行结果报告
@@ -157,6 +188,25 @@ export GITLAB_TOKEN="glpat-xxxxxxxxxxxxxxxxxxxx"
   --mr-state merged
 ```
 
+### 示例6：批量批准 Group 下 dev → release 的 MR
+```bash
+./target/release/autoMR \
+  --mode approve-mrs \
+  --gitlab-url https://gitlab.com/api/v4 \
+  --gitlab-token glpat-xxxxxxxxxxxxxxxxxxxx \
+  --group-path server/lobby
+```
+
+### 示例7：批量批准指定分支的 MR
+```bash
+./target/release/autoMR \
+  --mode approve-mrs \
+  --gitlab-url https://gitlab.com/api/v4 \
+  --group-path my-group/subgroup \
+  --source-branch feature/next \
+  --target-branch main
+```
+
 ## 注意事项
 
 - 确保所有仓库都配置了Git远程仓库（MR和Tag模式）
@@ -165,7 +215,8 @@ export GITLAB_TOKEN="glpat-xxxxxxxxxxxxxxxxxxxx"
 - 确保有权限推送到远程仓库（MR和Tag模式）
 - **MR模式**: 需要网络连接访问GitLab API
 - **List-MRs模式**: 需要网络连接访问GitLab API
-- **List-MRs模式**: 不需要指定 `--path` 参数，它会列出你在GitLab上创建的所有MR
+- **list-mrs 模式**: 不需要指定 `--path`，会列出你在 GitLab 上创建的所有 MR
+- **approve-mrs 模式**: 不需要指定 `--path`；按 Group 列出项目（含子 Group），仅对「已打开」且源/目标分支匹配的 MR 调用 Approve API；默认 dev → release
 - **Tag模式**: 脚本会自动拉取分支最新代码，确保基于最新版本创建tag
 - **Tag模式**: 脚本会自动切换回原来的分支，不会影响你的工作环境
 
