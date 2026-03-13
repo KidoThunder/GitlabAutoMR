@@ -2,6 +2,9 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -48,6 +51,44 @@ struct Args {
     /// MR状态筛选（list-mrs 模式使用）: opened, closed, locked, merged, all
     #[arg(long, default_value = "opened")]
     mr_state: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    source_branch: Option<String>,
+    target_branch: Option<String>,
+    gitlab_url: Option<String>,
+    group_path: Option<String>,
+    gitlab_token: Option<String>,
+    checkout_branch: Option<String>,
+    tag_name: Option<String>,
+    tag_message: Option<String>,
+}
+
+fn load_config() -> Config {
+    // 尝试加载的路径顺序：
+    // 1. 当前目录下的 gitlab-tools.toml
+    // 2. 当前目录下的 .gitlab-tools.toml
+    // 3. 用户主目录下的 .gitlab-tools.toml
+    let mut paths = vec![
+        Path::new("gitlab-tools.toml").to_path_buf(),
+        Path::new(".gitlab-tools.toml").to_path_buf(),
+    ];
+    
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(Path::new(&home).join(".gitlab-tools.toml"));
+    }
+
+    for path in paths {
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(config) = toml::from_str(&content) {
+                    return config;
+                }
+            }
+        }
+    }
+    Config::default()
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +363,7 @@ impl GitLabClient {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let config = load_config();
 
     let token = if args.mode == "mr"
         || args.mode == "tag"
@@ -330,6 +372,7 @@ async fn main() -> Result<()> {
     {
         args.gitlab_token
             .or_else(|| std::env::var("GITLAB_TOKEN").ok())
+            .or(config.gitlab_token.clone())
             .ok_or_else(|| {
                 anyhow!("GitLab token required. Set GITLAB_TOKEN or use --gitlab-token")
             })?
@@ -339,17 +382,25 @@ async fn main() -> Result<()> {
 
     match args.mode.as_str() {
         "mr" => {
-            let source_branch = args.source_branch.ok_or_else(|| {
-                anyhow!("在MR模式下，必须指定 --source-branch 参数")
-            })?;
-            let target_branch = args.target_branch.ok_or_else(|| {
-                anyhow!("在MR模式下，必须指定 --target-branch 参数")
-            })?;
-            let gitlab_url = args.gitlab_url.ok_or_else(|| {
-                anyhow!("在MR模式下，必须指定 --gitlab-url 参数")
-            })?;
-            let group_path = args.group_path.ok_or_else(|| {
-                anyhow!("在 MR 模式下，必须指定 --group-path 参数，例如 server/lobby")
+            let source_branch = args.source_branch
+                .or(config.source_branch)
+                .ok_or_else(|| {
+                    anyhow!("在MR模式下，必须指定 --source-branch 参数")
+                })?;
+            let target_branch = args.target_branch
+                .or(config.target_branch)
+                .ok_or_else(|| {
+                    anyhow!("在MR模式下，必须指定 --target-branch 参数")
+                })?;
+            let gitlab_url = args.gitlab_url
+                .or(config.gitlab_url)
+                .ok_or_else(|| {
+                    anyhow!("在MR模式下，必须指定 --gitlab-url 参数")
+                })?;
+            let group_path = args.group_path
+                .or(config.group_path)
+                .ok_or_else(|| {
+                    anyhow!("在 MR 模式下，必须指定 --group-path 参数，例如 server/lobby")
             })?;
 
             let gitlab_client = GitLabClient::new(gitlab_url, token);
@@ -360,18 +411,27 @@ async fn main() -> Result<()> {
             }
         }
         "tag" => {
-            let checkout_branch = args.checkout_branch.ok_or_else(|| {
-                anyhow!("在 tag 模式下，必须指定 --checkout-branch 参数")
+            let checkout_branch = args.checkout_branch
+                .or(config.checkout_branch)
+                .ok_or_else(|| {
+                    anyhow!("在 tag 模式下，必须指定 --checkout-branch 参数")
+                })?;
+            let tag_name = args.tag_name
+                .or(config.tag_name)
+                .ok_or_else(|| {
+                    anyhow!("在tag模式下，必须指定 --tag-name 参数")
+                })?;
+            let gitlab_url = args.gitlab_url
+                .or(config.gitlab_url)
+                .ok_or_else(|| {
+                    anyhow!("在 tag 模式下，必须指定 --gitlab-url 参数")
+                })?;
+            let group_path = args.group_path
+                .or(config.group_path)
+                .ok_or_else(|| {
+                    anyhow!("在 tag 模式下，必须指定 --group-path 参数，例如 server/lobby")
             })?;
-            let tag_name = args.tag_name.ok_or_else(|| {
-                anyhow!("在tag模式下，必须指定 --tag-name 参数")
-            })?;
-            let gitlab_url = args.gitlab_url.ok_or_else(|| {
-                anyhow!("在 tag 模式下，必须指定 --gitlab-url 参数")
-            })?;
-            let group_path = args.group_path.ok_or_else(|| {
-                anyhow!("在 tag 模式下，必须指定 --group-path 参数，例如 server/lobby")
-            })?;
+            let tag_message = args.tag_message.or(config.tag_message);
 
             let gitlab_client = GitLabClient::new(gitlab_url, token);
             let projects = gitlab_client.list_group_projects(&group_path).await?;
@@ -381,15 +441,17 @@ async fn main() -> Result<()> {
                     &project,
                     &checkout_branch,
                     &tag_name,
-                    args.tag_message.as_deref(),
+                    tag_message.as_deref(),
                     &gitlab_client,
                 )
                 .await;
             }
         }
         "list-mrs" => {
-            let gitlab_url = args.gitlab_url.ok_or_else(|| {
-                anyhow!("在list-mrs模式下，必须指定 --gitlab-url 参数")
+            let gitlab_url = args.gitlab_url
+                .or(config.gitlab_url)
+                .ok_or_else(|| {
+                    anyhow!("在list-mrs模式下，必须指定 --gitlab-url 参数")
             })?;
 
             let gitlab_client = GitLabClient::new(gitlab_url, token);
@@ -407,15 +469,23 @@ async fn main() -> Result<()> {
             }
         }
         "approve-mrs" => {
-            let gitlab_url = args.gitlab_url.ok_or_else(|| {
-                anyhow!("在 approve-mrs 模式下，必须指定 --gitlab-url 参数")
-            })?;
-            let group_path = args.group_path.ok_or_else(|| {
-                anyhow!("在 approve-mrs 模式下，必须指定 --group-path 参数，例如 server/lobby")
-            })?;
+            let gitlab_url = args.gitlab_url
+                .or(config.gitlab_url)
+                .ok_or_else(|| {
+                    anyhow!("在 approve-mrs 模式下，必须指定 --gitlab-url 参数")
+                })?;
+            let group_path = args.group_path
+                .or(config.group_path)
+                .ok_or_else(|| {
+                    anyhow!("在 approve-mrs 模式下，必须指定 --group-path 参数，例如 server/lobby")
+                })?;
 
-            let source_branch = args.source_branch.unwrap_or_else(|| "dev".to_string());
-            let target_branch = args.target_branch.unwrap_or_else(|| "release".to_string());
+            let source_branch = args.source_branch
+                .or(config.source_branch)
+                .unwrap_or_else(|| "dev".to_string());
+            let target_branch = args.target_branch
+                .or(config.target_branch)
+                .unwrap_or_else(|| "release".to_string());
 
             let gitlab_client = GitLabClient::new(gitlab_url, token);
             let projects = gitlab_client.list_group_projects(&group_path).await?;
